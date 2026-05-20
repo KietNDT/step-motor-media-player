@@ -8,6 +8,9 @@
 #include <stdint.h>
 
 typedef enum {
+    NOTE_C0,  NOTE_CS0, NOTE_D0,  NOTE_DS0, NOTE_E0,
+    NOTE_F0,  NOTE_FS0, NOTE_G0,  NOTE_GS0, NOTE_A0,  NOTE_AS0, NOTE_B0,
+
     // Octave 1
     NOTE_C1,  NOTE_CS1, NOTE_D1,  NOTE_DS1, NOTE_E1,
     NOTE_F1,  NOTE_FS1, NOTE_G1,  NOTE_GS1, NOTE_A1,  NOTE_AS1, NOTE_B1,
@@ -43,6 +46,20 @@ typedef enum {
 // Frequencies in Hz × 10 (standard equal temperament, A4=440Hz)
 // ARR = (1,000,000 / (freq * 2)) - 1
 static const uint32_t NOTE_ARR[NOTE_COUNT] = {
+
+    [NOTE_C0]  = 1000000/(  33*2)-1,   // ~32.7 Hz → 33 Hz
+    [NOTE_CS0] = 1000000/(  35*2)-1,   // 34.6 Hz → 35
+    [NOTE_D0]  = 1000000/(  37*2)-1,   // 36.7 Hz → 37
+    [NOTE_DS0] = 1000000/(  39*2)-1,   // 38.9 Hz → 39
+    [NOTE_E0]  = 1000000/(  41*2)-1,   // 41.2 Hz → 41
+    [NOTE_F0]  = 1000000/(  44*2)-1,   // 43.7 Hz → 44
+    [NOTE_FS0] = 1000000/(  46*2)-1,   // 46.2 Hz → 46
+    [NOTE_G0]  = 1000000/(  49*2)-1,   // 49.0 Hz → 49
+    [NOTE_GS0] = 1000000/(  52*2)-1,   // 51.9 Hz → 52
+    [NOTE_A0]  = 1000000/(  55*2)-1,   // 55.0 Hz → 55
+    [NOTE_AS0] = 1000000/(  58*2)-1,   // 58.3 Hz → 58
+    [NOTE_B0]  = 1000000/(  62*2)-1,   //  61.7 Hz
+
     // Octave 1
     [NOTE_C1]  = 1000000/(  33*2)-1,   // ~32.7 Hz → 33 Hz
     [NOTE_CS1] = 1000000/(  35*2)-1,   // 34.6 Hz → 35
