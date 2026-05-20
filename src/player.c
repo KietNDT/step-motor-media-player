@@ -1,19 +1,27 @@
-// src/player.c — engine + B1 button (PA0) → next song
-
+// src/player.c — Hybrid: friend's hardware init + your smooth note switching
 #include "player.h"
 #include "songs.h"
 #include "stm32f4xx.h"
 
-uint8_t volume = 75;
+uint8_t volume = 80;   // you can adjust (50‑100)
 
 // ---------------------------------------------------------------------------
-// SEQUENCER STATE
+// 3-VOICE SEQUENCER STATE
 // ---------------------------------------------------------------------------
+typedef struct {
+    const Step*       steps;
+    uint16_t          length;
+    volatile uint16_t note_idx;
+    volatile uint16_t note_ms;
+    volatile uint8_t  load_next;
+} VoiceState;
+
 static const Song*       current_song  = 0;
-static volatile uint16_t note_ms       = 0;   // ms remaining on current note
-static volatile uint8_t  note_idx      = 0;
-static volatile uint8_t  load_next     = 1;
 static volatile uint8_t  current_song_idx = 0;
+
+static VoiceState voice_melody  = { 0, 0, 0, 0, 1 };
+static VoiceState voice_harmony = { 0, 0, 0, 0, 1 };
+static VoiceState voice_bass    = { 0, 0, 0, 0, 1 };
 
 // ---------------------------------------------------------------------------
 // CLOCK — HSI → PLL → 100MHz
@@ -31,13 +39,23 @@ static void clock_init(void) {
 }
 
 // ---------------------------------------------------------------------------
-// TIM1 — PWM on PA8 (TIM1_CH1)
+// DIR PINS (PB0, PB8, PB2) — set low (forward)
+// ---------------------------------------------------------------------------
+static void dir_pins_init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    // PB0, PB8, PB2 as outputs
+    GPIOB->MODER &= ~((3<<0) | (3<<16) | (3<<4));
+    GPIOB->MODER |=  ((1<<0) | (1<<16) | (1<<4));
+    GPIOB->ODR &= ~((1<<0) | (1<<8) | (1<<2));  // all LOW
+}
+
+// ---------------------------------------------------------------------------
+// TIM1 — PWM on PA8 (TIM1_CH1) — Melody
 // ---------------------------------------------------------------------------
 static void tim1_init(void) {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     GPIOA->MODER  = (GPIOA->MODER & ~(3<<16)) | (2<<16);  // PA8 AF
-    GPIOA->AFR[1] = (GPIOA->AFR[1] & ~0xF)    | 1;        // AF1 = TIM1
-
+    GPIOA->AFR[1] = (GPIOA->AFR[1] & ~0xF) | 1;           // AF1 = TIM1
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
     TIM1->PSC   = 99;
     TIM1->ARR   = NOTE_ARR[NOTE_A4];
@@ -47,6 +65,43 @@ static void tim1_init(void) {
     TIM1->BDTR  = TIM_BDTR_MOE;
     TIM1->CR1  |= TIM_CR1_ARPE;
     TIM1->EGR   = TIM_EGR_UG;
+    TIM1->CR1  |= TIM_CR1_CEN;
+}
+
+// ---------------------------------------------------------------------------
+// TIM2 — PWM on PA5 (TIM2_CH1) — Harmony
+// ---------------------------------------------------------------------------
+static void tim2_init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    GPIOA->MODER  = (GPIOA->MODER & ~(3<<10)) | (2<<10);  // PA5 AF
+    GPIOA->AFR[0] = (GPIOA->AFR[0] & ~(0xF<<20)) | (1<<20); // AF1 = TIM2_CH1
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    TIM2->PSC   = 99;
+    TIM2->ARR   = NOTE_ARR[NOTE_A4];
+    TIM2->CCR1  = 0;
+    TIM2->CCMR1 = (6<<4)|(1<<3);
+    TIM2->CCER  = TIM_CCER_CC1E;
+    TIM2->CR1  |= TIM_CR1_ARPE;
+    TIM2->EGR   = TIM_EGR_UG;
+    TIM2->CR1  |= TIM_CR1_CEN;
+}
+
+// ---------------------------------------------------------------------------
+// TIM3 — PWM on PA6 (TIM3_CH1) — Bass
+// ---------------------------------------------------------------------------
+static void tim3_init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    GPIOA->MODER  = (GPIOA->MODER & ~(3<<12)) | (2<<12);  // PA6 AF
+    GPIOA->AFR[0] = (GPIOA->AFR[0] & ~(0xF<<24)) | (2<<24); // AF2 = TIM3
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+    TIM3->PSC   = 99;
+    TIM3->ARR   = NOTE_ARR[NOTE_A4];
+    TIM3->CCR1  = 0;
+    TIM3->CCMR1 = (6<<4)|(1<<3);
+    TIM3->CCER  = TIM_CCER_CC1E;
+    TIM3->CR1  |= TIM_CR1_ARPE;
+    TIM3->EGR   = TIM_EGR_UG;
+    TIM3->CR1  |= TIM_CR1_CEN;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,111 +120,98 @@ static void tim4_init(void) {
 }
 
 // ---------------------------------------------------------------------------
-// B1 USER BUTTON — PA0, active HIGH on DISCO board, no pull needed
-// EXTI0 → next song on rising edge
-// Debounce: ignore second press within 300ms using TIM4 ms counter
+// SMOOTH NOTE PLAY (no timer stop, just update ARR/CCR and force update)
 // ---------------------------------------------------------------------------
-static void button_init(void) {
-    // PA0 input, no pull (board has external pull-down, button pulls HIGH)
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    GPIOA->MODER &= ~(3<<0);   // PA0 = input
-    GPIOA->PUPDR &= ~(3<<0);   // no pull
+static inline void play_note_on_timer(TIM_TypeDef* tim, uint8_t note) {
+    uint32_t arr = NOTE_ARR[note];
+    if (arr == 0) {
+        tim->CCR1 = 0;           // REST → silence
+        tim->EGR = TIM_EGR_UG;
+        return;
+    }
+    tim->ARR  = arr;
+    tim->CCR1 = (arr * volume) / 200;
+    tim->EGR  = TIM_EGR_UG;      // immediate reload
+}
 
-    // EXTI0 → PA0
-    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
-    SYSCFG->EXTICR[0] &= ~(0xF<<0);   // EXTI0 = PA (0000)
+static inline void play_motor1(uint8_t note) { play_note_on_timer(TIM1, note); }
+static inline void play_motor2(uint8_t note) { play_note_on_timer(TIM2, note); }
+static inline void play_motor3(uint8_t note) { play_note_on_timer(TIM3, note); }
 
-    EXTI->IMR  |= (1<<0);   // unmask EXTI0
-    EXTI->RTSR |= (1<<0);   // rising edge trigger (button press = PA0 goes HIGH)
-    EXTI->FTSR &= ~(1<<0);  // not falling
+// ---------------------------------------------------------------------------
+// VOICE TICK (same as friend's, works correctly)
+// ---------------------------------------------------------------------------
+static inline void tick_voice(VoiceState* v, void (*play_fn)(uint8_t)) {
+    if (!v->steps || v->length == 0) return;
 
-    NVIC_SetPriority(EXTI0_IRQn, 2);
-    NVIC_EnableIRQ(EXTI0_IRQn);
+    if (v->load_next) {
+        v->load_next = 0;
+        play_fn(v->steps[v->note_idx].note);
+        v->note_ms = v->steps[v->note_idx].dur_ms;
+        v->note_idx++;
+        if (v->note_idx >= v->length) v->note_idx = 0;   // loop
+    }
+
+    if (v->note_ms > 0) v->note_ms--;
+    if (v->note_ms == 0) v->load_next = 1;
 }
 
 // ---------------------------------------------------------------------------
-// INTERNAL — apply one step to TIM1
+// TIM4 ISR
 // ---------------------------------------------------------------------------
-static inline void play_step(uint8_t idx) {
-    uint32_t arr = NOTE_ARR[current_song->steps[idx].note];
-    TIM1->CR1 &= ~TIM_CR1_CEN;
-    if (arr == 0) return;                   // REST
-    TIM1->ARR  = arr;
-    TIM1->CCR1 = (arr * volume) / 200;
-    TIM1->EGR  = TIM_EGR_UG;
-    TIM1->CR1 |= TIM_CR1_CEN;
-}
-
-// ---------------------------------------------------------------------------
-// TIM4 ISR — 1ms sequencer tick
-// ---------------------------------------------------------------------------
-static volatile uint32_t ms_tick       = 0;   // free-running ms counter
+static volatile uint32_t ms_tick = 0;
 
 void TIM4_IRQHandler(void) {
     TIM4->SR &= ~TIM_SR_UIF;
     ms_tick++;
     if (!current_song) return;
 
-    if (load_next) {
-        load_next = 0;
-        play_step(note_idx);
-        note_ms = current_song->steps[note_idx].dur_ms;   // direct ms now
-        note_idx++;
-        if (note_idx >= current_song->length) note_idx = 0;
-    }
-
-    if (note_ms > 0) note_ms--;
-    if (note_ms == 0) load_next = 1;
+    tick_voice(&voice_melody,  play_motor1);
+    tick_voice(&voice_harmony, play_motor2);
+    tick_voice(&voice_bass,    play_motor3);
 }
 
 // ---------------------------------------------------------------------------
-// EXTI0 ISR — B1 button press → next song
-// ---------------------------------------------------------------------------
-static volatile uint32_t last_press_ms = 0;   // for debounce
-
-
-// ms_tick incremented in TIM4 ISR — add this line to TIM4_IRQHandler above:
-// (already handled below via a shared counter — see note)
-
-void EXTI0_IRQHandler(void) {
-    EXTI->PR = (1<<0);   // clear pending flag FIRST
-
-    // Debounce: ignore if < 300ms since last press
-    if ((ms_tick - last_press_ms) < 300) return;
-    last_press_ms = ms_tick;
-
-    player_next_song();
-}
-
-// ---------------------------------------------------------------------------
-// PUBLIC API
+// PUBLIC API (uses your 3-motor Song struct from songs.h)
 // ---------------------------------------------------------------------------
 void player_init(void) {
     clock_init();
+    dir_pins_init();
     tim1_init();
+    tim2_init();
+    tim3_init();
     tim4_init();
-    button_init();
 }
 
-void player_play(uint8_t song_index) {
-    if (song_index >= SONG_COUNT) return;
-    TIM1->CR1   &= ~TIM_CR1_CEN;
-    note_idx     = 0;
-    load_next    = 1;
-    current_song = &song_list[song_index];
-    current_song_idx = song_index;
-}
+void player_play_3ch(const Step* melody, const Step* harmony, const Step* bass,
+                     uint16_t mel_len, uint16_t har_len, uint16_t bas_len) {
+    // Stop all motors
+    TIM1->CCR1 = 0; TIM2->CCR1 = 0; TIM3->CCR1 = 0;
+    TIM1->EGR = TIM2->EGR = TIM3->EGR = TIM_EGR_UG;
 
-void player_next_song(void) {
-    uint8_t next = (current_song_idx + 1) % SONG_COUNT;
-    player_play(next);
-}
+    voice_melody.steps  = melody;
+    voice_melody.length = mel_len;
+    voice_melody.note_idx = 0;
+    voice_melody.note_ms = 0;
+    voice_melody.load_next = 1;
 
-void player_stop(void) {
-    current_song = 0;
-    TIM1->CR1 &= ~TIM_CR1_CEN;
+    voice_harmony.steps  = harmony;
+    voice_harmony.length = har_len;
+    voice_harmony.note_idx = 0;
+    voice_harmony.note_ms = 0;
+    voice_harmony.load_next = 1;
+
+    voice_bass.steps  = bass;
+    voice_bass.length = bas_len;
+    voice_bass.note_idx = 0;
+    voice_bass.note_ms = 0;
+    voice_bass.load_next = 1;
+
+    current_song = (const Song*)1; // dummy non-NULL to enable ISR
 }
 
 void player_set_volume(uint8_t vol) {
     volume = (vol > 100) ? 100 : vol;
 }
+
+// Optional: if you need single-motor mode, add stub or ignore
